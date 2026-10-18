@@ -43,6 +43,12 @@ def _match(pattern: str, rel: str) -> bool:
 
 
 def load_scope_profile(root: str | Path) -> ScopeProfile:
+    """Load the ``scope`` section of ``<root>/.ghostslice.json``.
+
+    A missing file means an empty profile. Unknown keys inside the
+    ``scope`` section raise ValueError, so a typo cannot silently
+    disable a sensitive path.
+    """
     candidate = Path(root) / ".ghostslice.json"
     if not candidate.is_file():
         return ScopeProfile()

@@ -61,6 +61,7 @@ def _capped_scope(scope: dict) -> dict:
         "changed": [
             {"path": c["path"], "status": c["status"],
              "risk_score": c["risk_score"], "risk_reasons": c["risk_reasons"],
+             "lost_covering_tests": c.get("lost_covering_tests", []),
              "symbols": [{"qualified": s["qualified"],
                           "caller_count": s.get("caller_count", 0),
                           "risk_reasons": s.get("risk_reasons", [])}
@@ -74,6 +75,10 @@ def _capped_scope(scope: dict) -> dict:
 
 
 def tool_scope_pack(args: dict) -> dict:
+    """MCP ``scope_pack``: build a pack and return a capped summary.
+
+    Requires ``project`` and ``out`` in ``args``.
+    """
     from .gitinput import load_change_input
     from .pack import build_pack
     from .profile import load_scope_profile
@@ -94,6 +99,11 @@ def tool_scope_pack(args: dict) -> dict:
 
 
 def tool_scope_explain(args: dict) -> dict:
+    """MCP ``scope_explain``: explain a file from a pack's scope.json.
+
+    Requires a pack directory (``pack``, ``bundle``, or ``out``) and
+    a file (``file`` or ``path``) in ``args``.
+    """
     pack_dir = args.get("pack") or args.get("bundle") or args.get("out")
     file = args.get("file") or args.get("path")
     if not pack_dir or not file:
@@ -107,6 +117,14 @@ _DISPATCH = {"scope_pack": tool_scope_pack, "scope_explain": tool_scope_explain}
 
 
 def handle_message(msg: dict) -> dict | None:
+    """Handle one JSON-RPC message; return the response, or None for notifications."""
+    if not isinstance(msg, dict):
+        # A well-formed JSON value that is not an object (list,
+        # string, number) must get an Invalid Request response,
+        # not crash the server with an AttributeError.
+        return {"jsonrpc": "2.0", "id": None,
+                "error": {"code": -32600,
+                          "message": "invalid request: expected an object"}}
     method = msg.get("method", "")
     msg_id = msg.get("id")
     if method == "initialize":
@@ -140,6 +158,7 @@ def handle_message(msg: dict) -> dict | None:
 
 
 def serve() -> int:
+    """Serve JSON-RPC requests, one per line, on stdin/stdout until EOF."""
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -147,6 +166,12 @@ def serve() -> int:
         try:
             msg = json.loads(line)
         except ValueError:
+            # Answer with a JSON-RPC parse error instead of staying
+            # silent, which would leave the client waiting forever.
+            resp = {"jsonrpc": "2.0", "id": None,
+                    "error": {"code": -32700, "message": "parse error"}}
+            sys.stdout.write(json.dumps(resp) + "\n")
+            sys.stdout.flush()
             continue
         resp = handle_message(msg)
         if resp is not None:

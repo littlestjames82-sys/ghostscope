@@ -1,6 +1,12 @@
 #!/bin/sh
 # GhostScope demo: pack the high-blast-radius fixture as a git range.
-# Local only. Exits with a clear message if the core is not installed yet.
+#
+# Builds a throwaway git repo from tests/fixtures/high_blast_radius
+# (base commit, then a one-line change to a 6-caller function plus a
+# 220-line isolated change), packs HEAD~1..HEAD, and prints the
+# pack's REVIEW.md. Expected: the 6-caller change ranks first.
+# Local only. The temp directory is removed on exit.
+# Exits 3 with the expected outcome if no core can be found.
 set -eu
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 FIX="$HERE/../tests/fixtures/high_blast_radius"
@@ -23,7 +29,7 @@ if PYTHONPATH="$HERE/../src" python3 -c "import ghostscope" 2>/dev/null || comma
   else
     PYTHONPATH="$HERE/../src" python3 -m ghostscope pack . --base HEAD~1 --head HEAD -o "$WORK/pack"
   fi
-  echo "Pack written to $WORK/pack (temp dir, removed on exit in this demo script context)"
+  echo "Pack written to $WORK/pack (temporary: removed when this script exits)"
   cat "$WORK/pack/REVIEW.md" 2>/dev/null || find "$WORK/pack" -name REVIEW.md -exec cat {} \;
 else
   echo "GhostScope core not installed yet: nothing to run."

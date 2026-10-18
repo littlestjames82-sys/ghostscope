@@ -20,12 +20,26 @@ from .diffparse import FileChange, parse_diff
 
 
 class ScopeInputError(ValueError):
-    pass
+    """The change input is missing, ambiguous, or does not match reality."""
 
 
+def _safe_rel(path: str | None) -> bool:
+    """True only for a plain project-relative path (no absolute
+    prefix, no `..` component). Diff-supplied paths failing this are
+    never joined onto the filesystem or handed to git."""
+    if not path:
+        return False
+    if path.startswith(("/", "\\")):
+        return False
+    return ".." not in path.split("/")
+
+
+# errors="replace" everywhere below: a changed blob may be binary or
+# non-UTF-8, and strict text decoding would crash the whole pack
+# with a UnicodeDecodeError instead of treating it as content.
 def _git(root: Path, args: list[str]) -> str:
     proc = subprocess.run(["git", "-C", str(root), *args],
-                          capture_output=True, text=True)
+                          capture_output=True, text=True, errors="replace")
     if proc.returncode != 0:
         raise ScopeInputError(
             f"git {' '.join(args[:2])} failed: {proc.stderr.strip()[:300]}")
@@ -34,13 +48,13 @@ def _git(root: Path, args: list[str]) -> str:
 
 def is_git_repo(root: str | Path) -> bool:
     proc = subprocess.run(["git", "-C", str(root), "rev-parse", "--git-dir"],
-                          capture_output=True, text=True)
+                          capture_output=True, text=True, errors="replace")
     return proc.returncode == 0
 
 
 def git_show(root: str | Path, ref_path: str) -> str | None:
     proc = subprocess.run(["git", "-C", str(root), "show", ref_path],
-                          capture_output=True, text=True)
+                          capture_output=True, text=True, errors="replace")
     if proc.returncode != 0:
         return None
     return proc.stdout
@@ -49,7 +63,8 @@ def git_show(root: str | Path, ref_path: str) -> str | None:
 def ref_exists(root: str | Path, ref: str) -> bool:
     proc = subprocess.run(
         ["git", "-C", str(root), "rev-parse", "--verify", "--quiet",
-         ref + "^{commit}"], capture_output=True, text=True)
+         ref + "^{commit}"], capture_output=True, text=True,
+        errors="replace")
     return proc.returncode == 0
 
 
@@ -66,6 +81,8 @@ class ChangeInput:
         """Content of the file on the 'new' side of the change."""
         if change.status == "deleted":
             return None
+        if not _safe_rel(change.new_path):
+            return None
         if self.mode == "range" and self.head:
             return git_show(root, f"{self.head}:{change.new_path}")
         if self.mode == "staged":
@@ -78,6 +95,8 @@ class ChangeInput:
     def base_content(self, root: Path, change: FileChange) -> str | None:
         """Content of the file on the 'old' side, where recoverable."""
         if change.status == "added":
+            return None
+        if not _safe_rel(change.old_path):
             return None
         if self.mode == "range" and self.base:
             return git_show(root, f"{self.base}:{change.old_path}")
@@ -115,6 +134,13 @@ def load_change_input(project: str | Path, *, base: str | None = None,
                       head: str | None = None, staged: bool = False,
                       diff_file: str | Path | None = None,
                       verify: bool = True) -> ChangeInput:
+    """Load exactly one change input for ``project`` and verify it.
+
+    Choose a ``base``/``head`` range, ``staged``, or a ``diff_file``;
+    giving none or more than one raises ScopeInputError, as does a
+    diff that does not match the content it claims (unless
+    ``verify`` is False).
+    """
     root = Path(project).expanduser().resolve()
     given = sum(bool(x) for x in (bool(base or head), staged, bool(diff_file)))
     if given != 1:

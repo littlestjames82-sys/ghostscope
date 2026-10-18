@@ -122,6 +122,38 @@ def module_hint_for(path: str) -> str:
     return p.stem
 
 
+def outline_cover(outline: FileOutline, changed_path: str,
+                  changed_symbols: list[str]) -> dict:
+    """Does one file's outline cover a changed file/symbol set?
+
+    Single source of the covering semantics, shared by
+    covering_tests (head side) and by lost-coverage detection in
+    pack.py (base side, for test files the diff deleted or edited).
+    Returns file-level ``reasons`` (import, call, or the parser-lite
+    heuristic) plus the precise ``symbols`` the file calls: a bare
+    import proves file-level cover only, so symbol-level claims are
+    made from call hits alone and never guessed from an import.
+    """
+    reasons: list[str] = []
+    if changed_path in outline.imports:
+        reasons.append(f"imports {changed_path}")
+    called_names = set()
+    for sym in outline.symbols.values():
+        for c in sym.calls:
+            called_names.add(c.split(".")[-1])
+    hit_syms = sorted(s for s in changed_symbols if s in called_names)
+    if hit_syms:
+        reasons.append("calls " + ", ".join(hit_syms))
+    if outline.method != "ast" and not reasons:
+        # parser-lite: fall back to a name mention in imports/text
+        stem = module_hint_for(changed_path)
+        if stem and any(stem in ext for ext in outline.external):
+            reasons.append(f"mentions module {stem} in imports (heuristic)")
+    method = "python-ast" if outline.method == "ast" else \
+        "parser-lite heuristic (name/import based)"
+    return {"reasons": reasons, "symbols": hit_syms, "method": method}
+
+
 def covering_tests(scan_result: ScanResult, graph: ProjectGraph,
                    changed_path: str, changed_symbols: list[str]) -> list[dict]:
     """Test files covering a changed file/symbol set.
@@ -131,30 +163,14 @@ def covering_tests(scan_result: ScanResult, graph: ProjectGraph,
     module; parser-lite heuristic (name/import mention) otherwise.
     """
     out: list[dict] = []
-    stem = module_hint_for(changed_path)
     for entry in scan_result.files:
         if not entry.is_test or entry.path == changed_path:
             continue
         outline = graph.outlines.get(entry.path)
         if outline is None:
             continue
-        reasons: list[str] = []
-        if changed_path in outline.imports:
-            reasons.append(f"imports {changed_path}")
-        called_names = set()
-        for sym in outline.symbols.values():
-            for c in sym.calls:
-                called_names.add(c.split(".")[-1])
-        hit_syms = [s for s in changed_symbols if s in called_names]
-        if hit_syms:
-            reasons.append("calls " + ", ".join(sorted(hit_syms)))
-        if outline.method != "ast":
-            # parser-lite: fall back to a name mention in imports/text
-            if not reasons and stem and any(
-                    stem in ext for ext in outline.external):
-                reasons.append(f"mentions module {stem} in imports (heuristic)")
-        if reasons:
-            method = "python-ast" if outline.method == "ast" else \
-                "parser-lite heuristic (name/import based)"
-            out.append({"path": entry.path, "reasons": reasons, "method": method})
+        cover = outline_cover(outline, changed_path, changed_symbols)
+        if cover["reasons"]:
+            out.append({"path": entry.path, "reasons": cover["reasons"],
+                        "method": cover["method"]})
     return out

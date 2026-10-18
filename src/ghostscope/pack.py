@@ -15,10 +15,11 @@ from pathlib import Path
 
 from . import __version__
 from .gitinput import ChangeInput
-from .graphbuild import TRANSITIVE_DEPTH_CAP, build_project_graph, covering_tests
+from .graphbuild import (TRANSITIVE_DEPTH_CAP, build_project_graph,
+                         covering_tests, outline_cover)
 from .outline import FileOutline, build_outline, resolve_imports
 from .profile import ScopeProfile
-from .scanner import ScanResult, language_for, read_text, scan
+from .scanner import ScanResult, is_test_file, language_for, read_text, scan
 from .secretslite import scan_added_lines
 from .slicer import SLICABLE, slice_text
 from .tokens import METHOD, estimate_tokens
@@ -72,6 +73,10 @@ def _changed_symbols(change, head_outline: FileOutline | None,
 
 def analyse(project: str | Path, inp: ChangeInput,
             profile: ScopeProfile) -> dict:
+    """Analyse a change: scan the project, build its graph, and report
+    each changed file with its symbols, callers, covering tests, risk
+    score and risk reasons, plus the factual notes for the pack.
+    """
     root = Path(project).expanduser().resolve()
     scan_result = scan(root)
     graph = build_project_graph(scan_result)
@@ -207,6 +212,10 @@ def analyse(project: str | Path, inp: ChangeInput,
             "risk_reasons": file_reasons,
         })
 
+    lost_map = _lost_covering_tests(root, inp, scan_result, graph,
+                                    changed_reports)
+    _apply_lost_coverage(changed_reports, lost_map)
+
     distances = graph.distances_from(changed_paths)
     notes = _factual_notes(changed_reports, changed_paths, all_covering, inp)
     return {
@@ -216,9 +225,116 @@ def analyse(project: str | Path, inp: ChangeInput,
         "changed": changed_reports,
         "distances": distances,
         "covering_tests_all": all_covering,
+        "lost_covering_tests": lost_map,
         "notes": notes,
         "repo_total_tokens": scan_result.total_tokens,
     }
+
+
+def _lost_covering_tests(root, inp, scan_result, graph,
+                         changed_reports) -> dict[str, list[dict]]:
+    """Test cover this diff itself removed, linked to what it covered.
+
+    Head-side covering tests can never see a test file the diff
+    deleted (it is gone from the scan) or a test function the diff
+    edited away, so without this pass a changed symbol whose only
+    cover vanished in the same diff reads as a generic "no covering
+    test" and the reviewer must infer the connection by hand. This
+    pass rebuilds the base-side outline of every test file the diff
+    deleted or modified and checks, with the same covering semantics
+    as covering_tests(), what it covered at base and no longer
+    covers at head. Only test files named by the diff are examined:
+    an untouched test file's cover cannot be lost by this diff.
+
+    Returns {changed_path: [{path, how, reasons, symbols,
+    file_level_only, method}]}. ``symbols`` holds only call-proven
+    symbols; an import-only base cover is file-level and is flagged
+    ``file_level_only`` rather than guessed onto symbols.
+    """
+    entries = scan_result.by_path()
+    all_paths = set(entries) | {c.path for c in inp.changes if c.path}
+    targets = [rep for rep in changed_reports
+               if rep["status"] != "deleted" and not is_test_file(rep["path"])]
+    if not targets:
+        return {}
+    lost: dict[str, list[dict]] = {}
+    for change in inp.changes:
+        tpath = change.path
+        if not tpath or not is_test_file(tpath):
+            continue
+        if change.status not in ("deleted", "modified"):
+            continue
+        base_text = inp.base_content(root, change)
+        if base_text is None:
+            continue
+        lang = entries[tpath].language if tpath in entries \
+            else language_for(tpath)
+        base_outline = build_outline(tpath, base_text, lang)
+        resolve_imports(base_outline, all_paths)
+        head_outline = graph.outlines.get(tpath) \
+            if change.status != "deleted" else None
+        for rep in targets:
+            if rep["path"] == tpath:
+                continue
+            sym_names = [s["name"] for s in rep["symbols"]
+                         if s["name"] != "<module>"]
+            if not sym_names:
+                continue
+            base_cover = outline_cover(base_outline, rep["path"], sym_names)
+            if not base_cover["reasons"]:
+                continue
+            head_cover = outline_cover(head_outline, rep["path"], sym_names) \
+                if head_outline is not None else {"reasons": [], "symbols": []}
+            lost_syms = [s for s in base_cover["symbols"]
+                         if s not in head_cover["symbols"]]
+            if not lost_syms and head_cover["reasons"]:
+                continue  # base cover fully intact at head
+            lost.setdefault(rep["path"], []).append({
+                "path": tpath,
+                "how": "deleted" if change.status == "deleted" else "removed",
+                "reasons": base_cover["reasons"],
+                "symbols": lost_syms,
+                "file_level_only": not base_cover["symbols"],
+                "method": base_cover["method"],
+            })
+    for entries_lost in lost.values():
+        entries_lost.sort(key=lambda e: e["path"])
+    return lost
+
+
+def _apply_lost_coverage(changed_reports, lost_map) -> None:
+    """Fold lost cover into per-symbol/per-file risk, reasons first.
+
+    A symbol proven (by call) to have lost a covering test gains the
+    explicit reason "covering test deleted/removed in this diff
+    (<test path>)" and +10. File-level-only cover (import-proven)
+    raises the file's reasons and score without inventing a
+    symbol-level claim.
+    """
+    for rep in changed_reports:
+        entries_lost = lost_map.get(rep["path"], [])
+        rep["lost_covering_tests"] = entries_lost
+        if not entries_lost:
+            continue
+        file_reasons = list(rep["risk_reasons"])
+        bumped_symbol = False
+        for entry in entries_lost:
+            reason = (f"covering test {entry['how']} in this diff "
+                      f"({entry['path']})")
+            file_reasons.append(reason)
+            for s in rep["symbols"]:
+                if s["name"] in entry["symbols"] \
+                        and reason not in s["risk_reasons"]:
+                    s["risk_reasons"].append(reason)
+                    s["risk_score"] += 10
+                    bumped_symbol = True
+        rep["risk_reasons"] = sorted(set(file_reasons) | {
+            r for s in rep["symbols"] for r in s["risk_reasons"]})
+        best = max([rep["risk_score"]] +
+                   [s["risk_score"] for s in rep["symbols"]])
+        # Symbol bumps already flow into `best`; a file-level-only
+        # loss has no symbol to carry the raise, so the file takes it.
+        rep["risk_score"] = best if bumped_symbol else best + 10
 
 
 def _factual_notes(changed_reports, changed_paths, all_covering, inp) -> list[dict]:
@@ -249,12 +365,42 @@ def _factual_notes(changed_reports, changed_paths, all_covering, inp) -> list[di
                             f"{len(stale)} caller(s) were not updated in this "
                             f"diff: {', '.join(sorted(stale)[:10])}",
                 })
-            if not rep["covering_tests"] and s["name"] != "<module>":
+            lost_for_sym = [e for e in rep.get("lost_covering_tests", [])
+                            if s["name"] in e["symbols"]]
+            for entry in lost_for_sym:
+                notes.append({
+                    "kind": "covering-test-deleted"
+                            if entry["how"] == "deleted"
+                            else "covering-test-removed",
+                    "path": path,
+                    "symbol": s["qualified"],
+                    "text": f"{path}: symbol {s['qualified']} lost its "
+                            f"covering test {entry['path']}, "
+                            f"{entry['how']} in this diff",
+                })
+            if not rep["covering_tests"] and s["name"] != "<module>" \
+                    and not lost_for_sym:
+                # When a lost-cover note fires it already states the
+                # cover is gone, more precisely; do not duplicate it
+                # with the generic note for the same symbol.
                 notes.append({
                     "kind": "no-covering-test", "path": path,
                     "symbol": s["qualified"],
                     "text": f"{path}: no covering test found for symbol "
                             f"{s['qualified']}",
+                })
+        for entry in rep.get("lost_covering_tests", []):
+            if entry["file_level_only"]:
+                notes.append({
+                    "kind": "covering-test-deleted"
+                            if entry["how"] == "deleted"
+                            else "covering-test-removed",
+                    "path": path,
+                    "symbol": None,
+                    "text": f"{path}: covering test {entry['path']} was "
+                            f"{entry['how']} in this diff; it covered this "
+                            f"file at import level (method: "
+                            f"{entry['method']})",
                 })
         if rep["status"] == "deleted":
             from .scanner import is_test_file
@@ -288,6 +434,13 @@ def _mode_for(path: str, analysis: dict, entries: dict) -> str | None:
 
 def build_pack(project: str | Path, out: str | Path, inp: ChangeInput,
                profile: ScopeProfile, fit: int | None = None) -> dict:
+    """Write a review pack to ``out`` and return its summary dict.
+
+    The returned dict has ``out``, ``scope`` (the scope.json content),
+    and ``fit_ok``. When ``fit`` is given and cannot be met without
+    downgrading a changed file or covering test, the pack is still
+    written and ``fit_ok`` is False.
+    """
     root = Path(project).expanduser().resolve()
     out = Path(out)
     analysis = analyse(root, inp, profile)
@@ -412,6 +565,9 @@ def build_pack(project: str | Path, out: str | Path, inp: ChangeInput,
             "pack_original_tokens_estimate": total_original,
             "changed_files": len(analysis["changed"]),
             "pack_files": len(records),
+            "lost_covering_tests": sum(
+                len(c.get("lost_covering_tests", []))
+                for c in analysis["changed"]),
         },
         "changed": analysis["changed"],
         "files": [
@@ -432,6 +588,11 @@ def build_pack(project: str | Path, out: str | Path, inp: ChangeInput,
             "token_counts": "estimates, not exact tokenizer counts",
             "non_python_symbols": "parser-lite (regex by line)",
             "covering_tests_non_python": "heuristic (name/import based)",
+            "lost_covering_tests": "reconstructed from the base side of "
+                                   "the diff for test files the diff "
+                                   "deleted or edited; symbol links are "
+                                   "call-proven, import-only cover is "
+                                   "reported at file level",
         },
     }
 
@@ -501,6 +662,7 @@ def _reading_order(analysis: dict, modes: dict[str, str]) -> list[dict]:
 
 
 def render_review(analysis: dict, scope: dict, modes: dict[str, str]) -> str:
+    """Render REVIEW.md: totals, riskiest-first reading order, and notes."""
     totals = scope["totals"]
     lines: list[str] = []
     lines.append("# GhostScope review pack")
@@ -553,6 +715,12 @@ def render_review(analysis: dict, scope: dict, modes: dict[str, str]) -> str:
             lines.append("- No covering tests found for this file. "
                          "That is stated plainly: review this change "
                          "without test cover behind it.")
+        for lost in rep.get("lost_covering_tests", []):
+            covered = ", ".join(lost["symbols"]) if lost["symbols"] \
+                else "this file (import-level cover)"
+            lines.append(f"- Lost covering test: {lost['path']} "
+                         f"({lost['how']} in this diff; covered: {covered}; "
+                         f"method: {lost['method']})")
         if rep["secret_findings"]:
             for fnd in rep["secret_findings"]:
                 lines.append(f"- Secret-shaped line added at line {fnd['line']} "
@@ -589,6 +757,11 @@ def render_review(analysis: dict, scope: dict, modes: dict[str, str]) -> str:
                  "languages are parser-lite (regex by line) and labelled as such.")
     lines.append("- Covering tests for non-Python files are heuristic "
                  "(name/import based), not proven.")
+    lines.append("- Lost covering tests are reconstructed from the base "
+                 "side of the diff for test files the diff deleted or "
+                 "edited. Symbol links are call-proven; import-only "
+                 "cover is reported at file level, not guessed onto a "
+                 "symbol.")
     lines.append(f"- Transitive callers are capped at depth "
                  f"{TRANSITIVE_DEPTH_CAP}.")
     lines.append("")
@@ -600,6 +773,11 @@ def render_review(analysis: dict, scope: dict, modes: dict[str, str]) -> str:
 # ---------------------------------------------------------------------------
 
 def explain_from_scope(scope: dict, path: str) -> dict:
+    """Explain ``path`` from a pack's parsed scope.json.
+
+    Returns whether the file is in the pack and, if so, its mode,
+    graph distance, risk score and reasons; if not, a plain reason.
+    """
     for f in scope.get("files", []):
         if f["path"] == path:
             return {"path": path, "in_pack": True, "mode": f["mode"],

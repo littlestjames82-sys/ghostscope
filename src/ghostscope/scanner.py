@@ -113,13 +113,16 @@ class ScanResult:
         return {f.path: f for f in self.files}
 
 
-def read_text(path: str | Path) -> str:
-    data = Path(path).read_bytes()
+def _decode(data: bytes) -> str:
     if data.startswith(b"\xef\xbb\xbf"):
         return data.decode("utf-8-sig", errors="replace")
     if data.startswith((b"\xff\xfe", b"\xfe\xff")):
         return data.decode("utf-16", errors="replace")
     return data.decode("utf-8", errors="replace")
+
+
+def read_text(path: str | Path) -> str:
+    return _decode(Path(path).read_bytes())
 
 
 def _gitignore_patterns(root: Path) -> list[str]:
@@ -196,7 +199,11 @@ def scan(root: str | Path) -> ScanResult:
             continue
         if b"\x00" in data[:8192]:
             continue
-        text = read_text(abspath)
+        # Decode the bytes already read: a second read here was
+        # unguarded (a file removed mid-scan crashed the scan) and
+        # could disagree with `size` if the file changed between
+        # the two reads.
+        text = _decode(data)
         lang = language_for(rel)
         generated, minified, vendored, evidence = detect_flags(rel, text, lang)
         result.files.append(FileEntry(

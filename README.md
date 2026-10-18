@@ -9,7 +9,7 @@ that cover them, and a riskiest-first reading order with the reasons
 written out. For a human reviewer it is the reading order. For an agent
 reviewer it is the prompt, at a fraction of the full-repo token cost.
 
-By Ghost Developer Studio. Working name (see PLAN.md). MIT core planned,
+By Ghost Developer Studio. Working name (see PLAN.md). MIT core,
 same pattern as GhostSlice / Agent Seatbelt / Ghost Hands. Local only:
 no hosting API, no network, no model calls in v0.1.
 
@@ -20,12 +20,12 @@ GhostVerify *checks* a patch, Agent Seatbelt governs what an agent
 
 ## Status
 
-v0.1 in build. This README documents the interface defined in PLAN.md.
-If a command below does not run yet, that is a build gap, not a
-different interface: the tests in `tests/` encode this contract and
-report the true state.
+v0.1. The CLI, pack export, `check`, and stdio MCP server described
+below are implemented in `src/ghostscope/`. The tests in `tests/`
+encode the contract in PLAN.md. Run them (see Tests, below) to see
+the state of a checkout.
 
-## Install (planned, from a checkout)
+## Install (from a checkout)
 
 ```bash
 cd ghostscope
@@ -33,7 +33,7 @@ pip install .
 ghostscope --help
 ```
 
-Or without installing, if the core uses the usual src layout:
+Or without installing, using the `src` layout directly:
 
 ```bash
 PYTHONPATH=src python3 -m ghostscope --help
@@ -44,7 +44,9 @@ standard library only), like the rest of the family.
 
 ## Quickstart
 
-From inside the project under review (a local git repo):
+Run these from inside the project under review (a local git repo),
+or pass that project's path instead of `.`. Pick exactly one input
+for `pack`: a `--base`/`--head` range, `--staged`, or `--diff`.
 
 ```bash
 # Pack the changes between two refs
@@ -56,9 +58,24 @@ ghostscope pack . --staged -o /tmp/review-pack
 # Pack from a diff file
 ghostscope pack . --diff changes.diff -o /tmp/review-pack
 
-# Why is this file in the pack, at this mode?
-ghostscope explain /tmp/review-pack src/shared.py   # via MCP: scope_explain
+# Validate the pack you just wrote
+ghostscope check /tmp/review-pack
+
+# Why is this file in the pack, and at what mode?
+# Signature: ghostscope explain <project> <file> --pack <pack-dir>
+ghostscope explain . src/shared.py --pack /tmp/review-pack
 ```
+
+Without `--pack`, `explain` re-analyses the project for the input
+range you give it (the same `--base` / `--head` / `--staged` /
+`--diff` options as `pack`) instead of reading an existing pack.
+Add `--json` to `pack`, `explain`, or `check` for machine-readable
+output instead of the human-readable summary.
+
+Exit codes: `0` means success, `1` means a `--fit` budget was not
+met (the pack is still written) or `check` failed, and `2` means a
+usage or input error (for example, a diff that does not match the
+working tree, index, or `head` blob it claims to describe).
 
 A pack is a normal GhostSlice bundle plus two GhostScope files:
 
@@ -69,10 +86,19 @@ review-pack/
   REVIEW.md       change summary, risk list in order, reading order,
                   token totals (estimates) vs repo total and raw diff
   PROMPT.md       the pack as an agent-ready prompt (Slice presets)
-  files/<rel>     changed files full, distance-1 neighbours at
-                  signatures, distance-2 at interfaces, covering
-                  tests full for changed symbols
+  files/<rel>     the sliced file bodies (see the mode table below)
 ```
+
+How much of each file is included depends on its graph distance
+from the change:
+
+| File | Mode in the pack |
+| --- | --- |
+| Changed file | `full` |
+| Distance-1 neighbour (direct caller / callee) | `signatures` |
+| Distance-2 neighbour | `interfaces` |
+| Covering test for a changed symbol | `full` |
+| Deleted file | `exclude` (listed in the manifest, no body) |
 
 Validate a pack the same way as any Slice bundle:
 
@@ -92,6 +118,17 @@ Reasons come from the import graph and the call graph. Python call
 edges are exact (stdlib `ast`, via GhostSlice). Other languages are
 import + outline level and are labelled `parser-lite` in the pack;
 their covering-test mapping is heuristic and says so.
+
+Cover that the diff itself removed is reported as lost, not just as
+missing: if a test file the diff deleted (or a test function it
+edited away) covered a changed symbol on the base side, the pack
+links them, with the reason `covering test deleted in this diff
+(<test path>)` (or `removed` for an edited test file), a factual
+note citing file + symbol + test, and a `lost_covering_tests` entry
+per changed file in `scope.json`. Symbol links are call-proven;
+import-only base cover is reported at file level, not guessed onto
+a symbol. A symbol that keeps other covering tests is not labelled
+as having no covering test.
 
 A profile can mark paths as sensitive so changes there always rank
 higher. In `.ghostslice.json`:
@@ -113,9 +150,10 @@ says.
 ghostscope pack . --base main --head HEAD --fit 40000 -o /tmp/review-pack
 ```
 
-Uses GhostSlice's fit ladder, with one rule on top: changed files are
-never downgraded. If the pack cannot fit without touching a changed
-file, the pack is still written and the exit code is 1.
+Uses GhostSlice's fit ladder, with one rule on top: changed files
+(and covering tests) are never downgraded. Neighbours are downgraded
+first. If the pack still cannot fit, the pack is still written and
+the exit code is 1.
 
 ## What GhostScope does not do (v0.1)
 
@@ -130,11 +168,19 @@ file, the pack is still written and the exit code is 1.
 
 ## MCP
 
-Stdio MCP server on the GhostSlice pattern, two tools:
+Start the stdio MCP server with:
+
+```bash
+ghostscope mcp
+```
+
+It follows the GhostSlice pattern and exposes two tools:
 
 - `scope_pack`: build a review pack for a project + git range.
+  Requires `project` and `out`; `base`, `head`, `staged`, `diff`,
+  and `fit` are optional.
 - `scope_explain`: why a file is in a pack, at what mode, with its
-  risk reasons.
+  risk reasons. Requires `pack` (the pack directory) and `file`.
 
 Payloads are capped summaries, no raw file bodies by default.
 
@@ -142,9 +188,10 @@ Payloads are capped summaries, no raw file bodies by default.
 
 ```bash
 PYTHONPATH=src:. python3 -m pytest tests -q
-# or, stdlib only (name the modules: the fixture projects under
-# tests/fixtures/ contain their own test_*.py files, which are data,
-# and tests/conftest.py keeps pytest from collecting them):
+# or, with the stdlib runner only (name the modules: the fixture
+# projects under tests/fixtures/ contain their own test_*.py files,
+# which are data, and tests/conftest.py keeps pytest from
+# collecting them):
 PYTHONPATH=.:src python3 -m unittest tests.test_fixtures_static tests.test_pack_integration -v
 ```
 
@@ -158,9 +205,12 @@ Verification bar in PLAN.md:
 - `deleted_covering_test`: a change whose only covering test is
   deleted in the same diff; the pack must say so in plain words.
 
-`tests/test_fixtures_static.py` validates the fixtures themselves and
-passes with no core installed. `tests/test_pack_integration.py` runs
-the real CLI and fails (not skips) while the core is missing.
+`tests/test_fixtures_static.py` validates the fixtures themselves.
+`tests/test_pack_integration.py` runs the real CLI and fails (rather
+than skipping) if the core cannot be imported, so a broken checkout
+cannot look green by accident. One integration test, the optional
+`ghostslice check` cross-check, skips when `ghostslice` is not on
+`PATH`.
 
 ## Examples
 

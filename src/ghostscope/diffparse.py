@@ -85,12 +85,46 @@ def _clean_path(raw: str) -> str | None:
     return raw
 
 
+def _check_safe_path(path: str | None) -> None:
+    """Reject absolute paths and `..` traversal in diff-supplied paths.
+
+    A diff file is untrusted input: its paths are later joined onto
+    the project root and the pack directory. A legitimate git path
+    is always relative and never contains a `..` component, so
+    anything else is refused loudly instead of followed silently.
+    """
+    if path is None:
+        return
+    if path.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:[\\/]", path) \
+            or ".." in path.split("/"):
+        raise ValueError(f"diff contains an unsafe path: {path!r}")
+
+
 def parse_diff(text: str) -> list[FileChange]:
+    """Parse unified-diff ``text`` into a list of FileChange objects."""
     changes: list[FileChange] = []
     cur: FileChange | None = None
     cur_hunk: Hunk | None = None
     new_no = old_no = 0
     for line in text.splitlines():
+        # A hunk is incomplete while its declared line counts have
+        # not been consumed. Inside an incomplete hunk a line such as
+        # "--- x" or "+++ x" is hunk *content* (a deleted line whose
+        # text starts "-- " / an added line whose text starts "++ "),
+        # never a file header: headers only occur between hunks.
+        in_hunk = cur_hunk is not None and (
+            old_no < cur_hunk.old_start + cur_hunk.old_count
+            or new_no < cur_hunk.new_start + cur_hunk.new_count)
+        if line.startswith("--- ") and not in_hunk \
+                and (cur is None or cur.hunks):
+            # Header-less unified diff (plain `diff -u` output has no
+            # "diff --git" separator): the --- line itself opens the
+            # next file's change. In git diffs the --- line follows a
+            # fresh "diff --git" whose change has no hunks yet, so
+            # this never fires there.
+            cur = FileChange(old_path=None, new_path=None)
+            changes.append(cur)
+            cur_hunk = None
         if line.startswith("diff --git "):
             cur = FileChange(old_path=None, new_path=None)
             changes.append(cur)
@@ -118,7 +152,7 @@ def parse_diff(text: str) -> list[FileChange]:
         if line.startswith("Binary files"):
             cur.is_binary = True
             continue
-        if line.startswith("--- "):
+        if line.startswith("--- ") and not in_hunk:
             p = _clean_path(line[4:])
             if p is not None:
                 cur.old_path = p
@@ -128,7 +162,7 @@ def parse_diff(text: str) -> list[FileChange]:
             if p is None and cur.old_path is None:
                 cur.status = "added"
             continue
-        if line.startswith("+++ "):
+        if line.startswith("+++ ") and not in_hunk:
             p = _clean_path(line[4:])
             if p is None:
                 cur.status = "deleted"
@@ -167,4 +201,6 @@ def parse_diff(text: str) -> list[FileChange]:
             c.status = "added"
         if c.new_path is None and c.status == "modified":
             c.status = "deleted"
+        _check_safe_path(c.old_path)
+        _check_safe_path(c.new_path)
     return [c for c in changes if c.path]
